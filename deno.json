@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true
+  },
+  "tasks": {
+    "discovery": "deno run --allow-net --allow-run --allow-read src/discovery_main.ts",
+    "example": "deno run --allow-net --allow-run --allow-read examples/main.ts"
+  }
+}
