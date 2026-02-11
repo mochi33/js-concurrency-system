@@ -205,6 +205,7 @@ export interface ScalingConfig {
 
 export interface DiscoveryConfig extends ScalingConfig {
   port: number;
+  host?: string;
   registry: string;
 }
 

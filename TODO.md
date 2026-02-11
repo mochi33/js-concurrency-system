@@ -5,23 +5,22 @@
 
 ---
 
-## High Priority（本番運用に必要）
+## ~~High Priority（本番運用に必要）~~ → 完了済み
 
-### 1. Graceful Drain（優雅な停止）
-- 現状: `shutdown` → 即座に close（実行中タスクが死ぬ）
-- 必要: 「新規タスクを受け付けない + 実行中タスクの完了を待つ」
-- API サーバーデプロイ時にデータロスを防ぐために必須
+### 1. ~~Graceful Drain（優雅な停止）~~ ✅
+- `ProcessNode.close(drainTimeout)`: draining フラグで新規タスクを拒否し、実行中タスクの完了を待機（タイムアウト付き）
+- `Discovery.shutdown(drainTimeout)`: 全ピアに shutdown 送信後、drain 完了を待機
+- API サーバーデプロイ時のデータロスを防止
 
-### 2. Discovery bind address の設定可能化
-- 現状: `127.0.0.1` にハードコード
-- 必要: `--host` フラグで設定可能にする
-- リモートノード接続（マルチマシン構成）に必須
-- 変更量は少ない（1行レベル）
+### 2. ~~Discovery bind address の設定可能化~~ ✅
+- `DiscoveryConfig.host` フィールド追加（デフォルト: `127.0.0.1`）
+- `--host` CLI フラグで設定可能に
+- リモートノード接続（マルチマシン構成）に対応
 
-### 3. Closed Multiplexer のメモリリーク修正
-- 閉じた Multiplexer が `incomingMuxes` Set に残り続ける
-- 長期運用でメモリが蓄積する問題
-- クリーンアップ処理の追加が必要
+### 3. ~~Closed Multiplexer のメモリリーク修正~~ ✅
+- `Multiplexer.onClose()` コールバック追加
+- 閉じた Multiplexer を `incomingMuxes` / `connectionPool` から自動削除
+- 長期運用時のメモリ蓄積問題を解決
 
 ---
 
@@ -79,3 +78,9 @@
 - [x] **Connection Pool** — TCP 接続を `Map<string, Multiplexer>` で再利用。同一ピアへの複数タスクが 1 接続を共有
 - [x] **Multi-task Concurrency** — `idle/busy` 二値を `activeTasks` カウンタ + `maxConcurrency`（デフォルト 4）に置換
 - [x] **Execution Timeout** — `SpawnOptions` の `execTimeout` 指定。Executor がタスクと `setTimeout` を race し、超過時に `ExecTimeoutError`
+
+## 完了済み (High Priority)
+
+- [x] **Graceful Drain** — `close(drainTimeout)` で新規タスク拒否 + 実行中タスク完了待ち。Discovery も drain 対応
+- [x] **Discovery bind address** — `DiscoveryConfig.host` + `--host` CLI フラグ。デフォルト `127.0.0.1`
+- [x] **Multiplexer メモリリーク修正** — `onClose` コールバックで `incomingMuxes` / `connectionPool` から自動削除
