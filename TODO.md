@@ -77,7 +77,36 @@
   );
   ```
 
-### 9. メトリクス & Observability
+### 9. ステートフル Actor モデル
+- 現状: タスクはすべてステートレスな関数実行であり、呼び出し間で状態を保持できない
+- 問題点:
+  - カウンター、セッション、キャッシュなど状態を持つワーカーを表現できない
+  - 状態を外部 DB に逃がす必要があり、レイテンシとコードの複雑さが増す
+  - Ray の `@ray.remote` クラス（Actor）相当の仕組みがない
+- 対応:
+  - `registry.registerActor()` でクラスベースの Actor を登録
+  - `node.createActor("CounterActor")` で特定ノード上にインスタンスを生成し、`ActorHandle` を取得
+  - `ActorHandle` 経由でメソッド呼び出し — 同一インスタンスへの呼び出しは直列化（メールボックス方式）
+  - Actor のライフサイクル管理: 明示的 destroy または idle タイムアウトで自動解放
+  - Actor の再配置（ノード障害時に別ノードで再生成）は将来的な拡張として検討
+- 例:
+  ```typescript
+  // Actor 定義
+  registry.registerActor("Counter", class {
+    private count = 0;
+    increment() { return ++this.count; }
+    getCount() { return this.count; }
+  });
+
+  // Actor 生成 & メソッド呼び出し
+  const counter = await node.createActor("Counter");
+  await counter.call("increment");  // 1
+  await counter.call("increment");  // 2
+  await counter.call("getCount");   // 2（状態が保持される）
+  await counter.destroy();
+  ```
+
+### 10. メトリクス & Observability
 - Discovery が公開すべき情報:
   - ノード数・アクティブタスク数
   - タスク完了レイテンシ (p50, p95, p99)
@@ -89,24 +118,24 @@
 
 ## Low Priority（拡張機能・Nice-to-have）
 
-### 10. Fan-out / Map-Reduce パターン
+### 11. Fan-out / Map-Reduce パターン
 - 同じタスクを全ノードに spawn して結果を集約
 - 例: `const results = await caller.fanout("search", [query], { merge: "concat" })`
 
-### 11. Sticky Routing（Affinity）
+### 12. Sticky Routing（Affinity）
 - 同じキー（userId 等）を一貫して同じノードにルーティング
 - ノードローカルキャッシュの活用が可能
 - 例: `spawn("getUserProfile", [userId], { affinity: userId })`
 
-### 12. タスク優先度
+### 13. タスク優先度
 - 例: `spawn("urgent_task", [data], { priority: "high" })`
 - Discovery がルーティング時に高優先タスクを優先
 
-### 13. Pure Function のリザルトキャッシュ
+### 14. Pure Function のリザルトキャッシュ
 - 関数を pure とマーク: `registry.register("fibonacci", fn, { pure: true, cacheTTL: 60_000 })`
 - 同じ引数 → キャッシュ済み結果を即座に返却
 
-### 14. Binary Protocol（MessagePack）
+### 15. Binary Protocol（MessagePack）
 - JSON を MessagePack に置き換え
 - 大きなデータ転送時に特に有効
 - シリアライズ/デシリアライズの高速化 + 転送サイズ削減
