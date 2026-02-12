@@ -45,10 +45,12 @@
   - 接続種別ごとに型を分離（Discovery 接続は `DiscoveryMessage` のみ受信）
   - switch の `default` を `never` 型チェックに置換して網羅性を保証
 
-### 6. Discovery 再接続
-- 現状: Discovery が落ちるとノードが切断され、復旧不可
-- Discovery 再起動時の自動再接続が必要
-- 本番稼働率に直結
+### 6. ~~Discovery 再接続~~ ✅
+- `discoveryLoop` が接続切断を検知すると自動で `reconnectLoop` を起動
+- 指数バックオフ（1s → 2s → 4s → ... → 最大30s）で再接続を試行
+- 再接続成功時に自動で再登録（`register` + `capacity_change`）
+- 再接続中の `discoveryRequest` は再接続完了まで待機（呼び出し側がブロックされない）
+- `close()` 時は再接続を中断しクリーンアップ
 
 ### 7. 構造化ログ + Request ID トラッキング
 - 現状: `console.log` のみ、トレーサビリティなし
@@ -103,3 +105,4 @@
 - [x] **Graceful Drain** — `close(drainTimeout)` で新規タスク拒否 + 実行中タスク完了待ち。Discovery も drain 対応
 - [x] **Discovery bind address** — `DiscoveryConfig.host` + `--host` CLI フラグ。デフォルト `127.0.0.1`
 - [x] **Multiplexer メモリリーク修正** — `onClose` コールバックで `incomingMuxes` / `connectionPool` から自動削除
+- [x] **Discovery 再接続** — 指数バックオフ（1s〜30s）で自動再接続。再登録+capacity報告。再接続中のspawnは待機
