@@ -26,18 +26,25 @@
 
 ## Medium Priority（運用性・可観測性の向上）
 
-### 4. Discovery 再接続
+### 4. Registry の簡易記法（Record 形式）サポート
+- 現状: `new Registry()` + `register()` を繰り返す冗長な記述が必要
+- 必要: `export default { multiply: async (ctx, a, b) => a * b }` のような Record 形式で定義可能に
+- `Registry.from()` で Registry インスタンスと `Record<string, TaskFunction>` の両方を受け付ける
+- `node_main.ts` / `node.ts` の `connect()` のローディング箇所を対応
+- 従来の Registry 形式も引き続き動作させる（後方互換）
+
+### 5. Discovery 再接続
 - 現状: Discovery が落ちるとノードが切断され、復旧不可
 - Discovery 再起動時の自動再接続が必要
 - 本番稼働率に直結
 
-### 5. 構造化ログ + Request ID トラッキング
+### 6. 構造化ログ + Request ID トラッキング
 - 現状: `console.log` のみ、トレーサビリティなし
 - 必要: 全ログに `taskId` を含める
 - フォーマット例: `[2024-02-11T10:00:00Z] [task=abc123] exec fibonacci on node-1`
 - デバッグ効率を大幅に改善
 
-### 6. メトリクス & Observability
+### 7. メトリクス & Observability
 - Discovery が公開すべき情報:
   - ノード数・アクティブタスク数
   - タスク完了レイテンシ (p50, p95, p99)
@@ -49,24 +56,24 @@
 
 ## Low Priority（拡張機能・Nice-to-have）
 
-### 7. Fan-out / Map-Reduce パターン
+### 8. Fan-out / Map-Reduce パターン
 - 同じタスクを全ノードに spawn して結果を集約
 - 例: `const results = await caller.fanout("search", [query], { merge: "concat" })`
 
-### 8. Sticky Routing（Affinity）
+### 9. Sticky Routing（Affinity）
 - 同じキー（userId 等）を一貫して同じノードにルーティング
 - ノードローカルキャッシュの活用が可能
 - 例: `spawn("getUserProfile", [userId], { affinity: userId })`
 
-### 9. タスク優先度
+### 10. タスク優先度
 - 例: `spawn("urgent_task", [data], { priority: "high" })`
 - Discovery がルーティング時に高優先タスクを優先
 
-### 10. Pure Function のリザルトキャッシュ
+### 11. Pure Function のリザルトキャッシュ
 - 関数を pure とマーク: `registry.register("fibonacci", fn, { pure: true, cacheTTL: 60_000 })`
 - 同じ引数 → キャッシュ済み結果を即座に返却
 
-### 11. Binary Protocol（MessagePack）
+### 12. Binary Protocol（MessagePack）
 - JSON を MessagePack に置き換え
 - 大きなデータ転送時に特に有効
 - シリアライズ/デシリアライズの高速化 + 転送サイズ削減
