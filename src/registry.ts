@@ -123,4 +123,30 @@ export class Registry {
   list(): string[] {
     return [...new Set([...this.fns.keys(), ...this.loaders.keys()])];
   }
+
+  /**
+   * Scan a directory and lazily register each .ts file as a task.
+   * File name (without extension) becomes the task name.
+   *
+   * Usage:
+   *   const registry = await Registry.fromDirectory(
+   *     new URL("./tasks", import.meta.url),
+   *   );
+   */
+  static async fromDirectory(dir: string | URL): Promise<Registry> {
+    const registry = new Registry();
+    const dirUrl = dir instanceof URL ? dir : new URL(dir);
+    const dirHref = dirUrl.href.endsWith("/")
+      ? dirUrl.href
+      : dirUrl.href + "/";
+
+    for await (const entry of Deno.readDir(dirUrl)) {
+      if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
+      const name = entry.name.replace(/\.ts$/, "");
+      const moduleUrl = new URL(entry.name, dirHref).href;
+      registry.lazy(name, () => import(moduleUrl));
+    }
+
+    return registry;
+  }
 }

@@ -331,6 +331,40 @@ console.log("\nTest 18: Registry — has() works for both eager and lazy");
   assert(!registry.has("c"), "has('c') is false (not registered)");
 }
 
+// ── Test 19: fromDirectory() scans directory and registers lazily ──
+console.log("\nTest 19: Registry — fromDirectory() scans directory and registers lazily");
+{
+  // Create a temp directory with task files
+  const tmpDir = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${tmpDir}/add.ts`,
+    `export default function(_ctx: any, ...args: any[]) { return (args[0] as number) + (args[1] as number); }`,
+  );
+  await Deno.writeTextFile(
+    `${tmpDir}/greet.ts`,
+    `export default function(_ctx: any, ...args: any[]) { return "hello " + args[0]; }`,
+  );
+  // Non-ts file should be ignored
+  await Deno.writeTextFile(`${tmpDir}/README.md`, `# ignore me`);
+
+  const registry = await Registry.fromDirectory(new URL(`file://${tmpDir}`));
+
+  const names = registry.list().sort();
+  assert(
+    JSON.stringify(names) === JSON.stringify(["add", "greet"]),
+    `list() returns [add, greet] (got ${JSON.stringify(names)})`,
+  );
+  assert(registry.has("add"), "has('add') is true");
+  assert(registry.get("add") === undefined, "get('add') is undefined before resolve (lazy)");
+
+  const addFn = await registry.resolve("add");
+  assert(typeof addFn === "function", "resolve('add') returns a function");
+  const result = addFn!(dummyCtx, 3, 4);
+  assert(result === 7, `add(3, 4) = 7 (got ${result})`);
+
+  await Deno.remove(tmpDir, { recursive: true });
+}
+
 // ── Results ──
 console.log(`\n========================================`);
 console.log(`Registry Tests: ${passed} passed, ${failed} failed`);
