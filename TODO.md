@@ -56,7 +56,28 @@
 - フォーマット例: `[2024-02-11T10:00:00Z] [task=abc123] exec fibonacci on node-1`
 - デバッグ効率を大幅に改善
 
-### 8. メトリクス & Observability
+### 8. 大規模データの共有オブジェクトストア
+- 現状: タスク引数・戻り値は毎回 TCP でシリアライズ送信されるため、大規模データの共有が非効率
+- 問題点:
+  - 同じデータを複数タスクで使う場合、タスク数分のコピーが発生
+  - 大きな配列やバイナリデータの転送がボトルネックになる
+  - Ray の Plasma（共有メモリオブジェクトストア）相当の仕組みがない
+- 対応:
+  - `ObjectStore` クラスの導入: `const ref = await store.put(largeData)` でデータを登録し、参照（ObjectRef）を取得
+  - タスク引数に ObjectRef を渡すと、Executor 側で自動的にデータをフェッチ（ローカルにあればゼロコピー）
+  - 参照カウントベースの自動 GC で不要データを解放
+  - 同一ノード上のタスクは共有メモリ（SharedArrayBuffer）経由でゼロコピーアクセス
+  - リモートノードへは初回フェッチ時にキャッシュし、以降はローカル参照
+- 例:
+  ```typescript
+  const ref = await node.put(hugeMatrix);  // ObjectStore に登録
+  // 100 タスクが同じデータを参照（コピーは発生しない）
+  const channels = Array.from({ length: 100 }, () =>
+    node.spawn("processChunk", [ref, chunkId++])
+  );
+  ```
+
+### 9. メトリクス & Observability
 - Discovery が公開すべき情報:
   - ノード数・アクティブタスク数
   - タスク完了レイテンシ (p50, p95, p99)
@@ -68,24 +89,24 @@
 
 ## Low Priority（拡張機能・Nice-to-have）
 
-### 9. Fan-out / Map-Reduce パターン
+### 10. Fan-out / Map-Reduce パターン
 - 同じタスクを全ノードに spawn して結果を集約
 - 例: `const results = await caller.fanout("search", [query], { merge: "concat" })`
 
-### 10. Sticky Routing（Affinity）
+### 11. Sticky Routing（Affinity）
 - 同じキー（userId 等）を一貫して同じノードにルーティング
 - ノードローカルキャッシュの活用が可能
 - 例: `spawn("getUserProfile", [userId], { affinity: userId })`
 
-### 11. タスク優先度
+### 12. タスク優先度
 - 例: `spawn("urgent_task", [data], { priority: "high" })`
 - Discovery がルーティング時に高優先タスクを優先
 
-### 12. Pure Function のリザルトキャッシュ
+### 13. Pure Function のリザルトキャッシュ
 - 関数を pure とマーク: `registry.register("fibonacci", fn, { pure: true, cacheTTL: 60_000 })`
 - 同じ引数 → キャッシュ済み結果を即座に返却
 
-### 13. Binary Protocol（MessagePack）
+### 14. Binary Protocol（MessagePack）
 - JSON を MessagePack に置き換え
 - 大きなデータ転送時に特に有効
 - シリアライズ/デシリアライズの高速化 + 転送サイズ削減
