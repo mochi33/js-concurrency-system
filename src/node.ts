@@ -23,6 +23,8 @@ const DEFAULT_SPAWN_TIMEOUT = 30_000;
 const DEFAULT_MAX_CONCURRENCY = 4;
 const MAX_RETRY = 3;
 const MEMORY_THRESHOLD = 512 * 1024 * 1024; // 512 MiB
+const RECONNECT_INITIAL_DELAY = 1_000; // 1 second
+const RECONNECT_MAX_DELAY = 30_000; // 30 seconds
 
 /**
  * Waiter for a discovery response message of a specific type.
@@ -51,6 +53,10 @@ export class ProcessNode {
   private discoveryWaiters: DiscoveryWaiter[] = [];
   private connectionPool = new Map<string, Multiplexer>();
   private incomingMuxes: Set<Multiplexer> = new Set();
+  private reconnecting = false;
+  private reconnectedPromise: Promise<void> | null = null;
+  private reconnectedResolve: (() => void) | null = null;
+  private reconnectLoopPromise: Promise<void> | null = null;
 
   constructor(
     private config: NodeConfig,
@@ -169,10 +175,18 @@ export class ProcessNode {
     }
     this.incomingMuxes.clear();
 
+    // Abort any in-progress reconnection
+    if (this.reconnectedResolve) {
+      this.reconnectedResolve();
+      this.reconnectedPromise = null;
+      this.reconnectedResolve = null;
+    }
+
     // Wait for loops to finish
     await Promise.allSettled([
       this.acceptLoopPromise,
       this.discoveryLoopPromise,
+      this.reconnectLoopPromise,
     ].filter(Boolean));
 
     console.log(`[Node ${this.processId}] Closed.`);
@@ -225,6 +239,10 @@ export class ProcessNode {
     msg: DiscoveryMessage,
     ...responseTypes: string[]
   ): Promise<DiscoveryMessage> {
+    // Wait for reconnection to complete if in progress
+    if (this.reconnecting && this.reconnectedPromise) {
+      await this.reconnectedPromise;
+    }
     if (!this.discoveryConn || this.discoveryConn.isClosed) {
       throw new SpawnError("Discovery connection not available");
     }
@@ -313,9 +331,6 @@ export class ProcessNode {
   }
 
   private async requestSpawn(): Promise<void> {
-    if (!this.discoveryConn || this.discoveryConn.isClosed) {
-      throw new SpawnError("Discovery connection not available");
-    }
     const response = await this.discoveryRequest(
       {
         type: "request_spawn",
@@ -428,11 +443,16 @@ export class ProcessNode {
         console.error(`[Node ${this.processId}] Discovery connection lost.`);
       }
     } finally {
-      // Reject any remaining waiters
-      for (const waiter of this.discoveryWaiters) {
-        waiter.reject(new Error("Discovery connection closed"));
+      if (!this.draining && !this.shutdownRequested && this.running) {
+        // Trigger automatic reconnection
+        this.startReconnect();
+      } else {
+        // Shutting down — reject any remaining waiters
+        for (const waiter of this.discoveryWaiters) {
+          waiter.reject(new Error("Discovery connection closed"));
+        }
+        this.discoveryWaiters = [];
       }
-      this.discoveryWaiters = [];
     }
   }
 
@@ -445,6 +465,92 @@ export class ProcessNode {
       this.discoveryWaiters.splice(idx, 1);
       waiter.resolve(msg);
     }
+  }
+
+  private startReconnect(): void {
+    if (this.reconnecting) return;
+    this.reconnecting = true;
+    this.reconnectedPromise = new Promise<void>((resolve) => {
+      this.reconnectedResolve = resolve;
+    });
+    this.reconnectLoopPromise = this.reconnectLoop();
+  }
+
+  private async reconnectLoop(): Promise<void> {
+    let delay = RECONNECT_INITIAL_DELAY;
+
+    while (this.running && !this.draining && !this.shutdownRequested) {
+      console.log(
+        `[Node ${this.processId}] Reconnecting to Discovery in ${delay}ms...`,
+      );
+      await new Promise<void>((r) => setTimeout(r, delay));
+
+      if (!this.running || this.draining || this.shutdownRequested) break;
+
+      try {
+        const rawConn = await Deno.connect({
+          hostname: this.config.discoveryHost,
+          port: this.config.discoveryPort,
+        });
+        const fc = new FramedConnection(rawConn);
+
+        // Re-register with Discovery
+        await fc.writeMessage({
+          type: "register",
+          processId: this.processId,
+          host: this.listenHost,
+          port: this.listenPort,
+          funcs: this.registry.list(),
+          maxConcurrency: this.maxConcurrency,
+        });
+
+        const response = await fc.readMessage();
+        if (
+          response === null ||
+          (response as DiscoveryMessage).type !== "registered"
+        ) {
+          fc.close();
+          throw new Error("Failed to register with Discovery");
+        }
+
+        this.discoveryConn = fc;
+        console.log(
+          `[Node ${this.processId}] Reconnected to Discovery.`,
+        );
+
+        // Report current capacity so Discovery has accurate state
+        await this.discoveryConn.writeMessage({
+          type: "capacity_change",
+          activeTasks: this.activeTasks,
+          maxConcurrency: this.maxConcurrency,
+        });
+
+        // Restart discovery message loop
+        this.discoveryLoopPromise = this.discoveryLoop();
+
+        // Signal reconnection success
+        this.reconnecting = false;
+        this.reconnectedResolve?.();
+        this.reconnectedPromise = null;
+        this.reconnectedResolve = null;
+        return;
+      } catch (e) {
+        console.error(
+          `[Node ${this.processId}] Reconnection failed: ${e}`,
+        );
+        delay = Math.min(delay * 2, RECONNECT_MAX_DELAY);
+      }
+    }
+
+    // Reconnection aborted (shutting down)
+    this.reconnecting = false;
+    for (const waiter of this.discoveryWaiters) {
+      waiter.reject(new Error("Discovery reconnection aborted"));
+    }
+    this.discoveryWaiters = [];
+    this.reconnectedResolve?.();
+    this.reconnectedPromise = null;
+    this.reconnectedResolve = null;
   }
 
   private async acceptLoop(): Promise<void> {
