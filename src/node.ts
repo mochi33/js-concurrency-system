@@ -46,6 +46,8 @@ export class ProcessNode {
   private acceptLoopPromise: Promise<void> | null = null;
   private discoveryLoopPromise: Promise<void> | null = null;
   private shutdownRequested = false;
+  private draining = false;
+  private drainResolvers: (() => void)[] = [];
   private discoveryWaiters: DiscoveryWaiter[] = [];
   private connectionPool = new Map<string, Multiplexer>();
   private incomingMuxes: Set<Multiplexer> = new Set();
@@ -108,7 +110,8 @@ export class ProcessNode {
     this.acceptLoopPromise = this.acceptLoop();
   }
 
-  async close(): Promise<void> {
+  async close(drainTimeout = 30_000): Promise<void> {
+    this.draining = true;
     this.running = false;
 
     // Reject all pending discovery waiters
@@ -117,17 +120,7 @@ export class ProcessNode {
     }
     this.discoveryWaiters = [];
 
-    // Send bye to Discovery
-    if (this.discoveryConn && !this.discoveryConn.isClosed) {
-      try {
-        await this.discoveryConn.writeMessage({ type: "bye" });
-      } catch {
-        // already closed
-      }
-      this.discoveryConn.close();
-    }
-
-    // Close listener
+    // Close listener — stop accepting new P2P connections
     if (this.listener) {
       try {
         this.listener.close();
@@ -135,6 +128,33 @@ export class ProcessNode {
         // already closed
       }
       this.listener = null;
+    }
+
+    // Send bye to Discovery so we won't be routed to anymore
+    if (this.discoveryConn && !this.discoveryConn.isClosed) {
+      try {
+        await this.discoveryConn.writeMessage({ type: "bye" });
+      } catch {
+        // already closed
+      }
+    }
+
+    // Wait for in-flight tasks to complete (graceful drain)
+    if (this.activeTasks > 0) {
+      console.log(
+        `[Node ${this.processId}] Draining ${this.activeTasks} active task(s)...`,
+      );
+      await this.waitForDrain(drainTimeout);
+      if (this.activeTasks > 0) {
+        console.warn(
+          `[Node ${this.processId}] Drain timeout reached, ${this.activeTasks} task(s) still active.`,
+        );
+      }
+    }
+
+    // Close discovery connection
+    if (this.discoveryConn && !this.discoveryConn.isClosed) {
+      this.discoveryConn.close();
     }
 
     // Close all pooled outgoing connections
@@ -156,6 +176,20 @@ export class ProcessNode {
     ].filter(Boolean));
 
     console.log(`[Node ${this.processId}] Closed.`);
+  }
+
+  /**
+   * Wait until all active tasks complete or the timeout expires.
+   */
+  private waitForDrain(timeout: number): Promise<void> {
+    if (this.activeTasks === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, timeout);
+      this.drainResolvers.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   /**
@@ -306,6 +340,9 @@ export class ProcessNode {
     const conn = await Deno.connect({ hostname: host, port });
     const fc = new FramedConnection(conn);
     mux = new Multiplexer(fc);
+    mux.onClose(() => {
+      this.connectionPool.delete(key);
+    });
     mux.startReading();
     this.connectionPool.set(key, mux);
     return mux;
@@ -429,6 +466,9 @@ export class ProcessNode {
     const fc = new FramedConnection(conn);
     const mux = new Multiplexer(fc);
     this.incomingMuxes.add(mux);
+    mux.onClose(() => {
+      this.incomingMuxes.delete(mux);
+    });
     mux.setUnroutedHandler((msg: P2PMessage) => {
       if (msg.type === "exec") {
         this.handleExecRequest(mux, msg as ExecMessage);
@@ -442,7 +482,7 @@ export class ProcessNode {
    * (no await between state check and state change) to prevent races.
    */
   private handleExecRequest(mux: Multiplexer, msg: ExecMessage): void {
-    if (this.activeTasks >= this.maxConcurrency) {
+    if (this.draining || this.activeTasks >= this.maxConcurrency) {
       mux.writeMessage({
         type: "reject",
         taskId: msg.taskId,
@@ -536,6 +576,15 @@ export class ProcessNode {
       ctx.dispose();
       this.activeTasks--;
       this.notifyCapacityChange();
+
+      // If draining and no more active tasks, resolve drain waiters
+      if (this.draining && this.activeTasks === 0) {
+        for (const resolver of this.drainResolvers) {
+          resolver();
+        }
+        this.drainResolvers = [];
+      }
+
       this.healthCheck();
     }
   }

@@ -32,8 +32,9 @@ export class Discovery {
 
   async start(): Promise<void> {
     this.running = true;
-    this.listener = Deno.listen({ hostname: "127.0.0.1", port: this.config.port });
-    console.log(`[Discovery] Listening on 127.0.0.1:${this.config.port}`);
+    const host = this.config.host ?? "127.0.0.1";
+    this.listener = Deno.listen({ hostname: host, port: this.config.port });
+    console.log(`[Discovery] Listening on ${host}:${this.config.port}`);
 
     // Spawn initial min processes
     for (let i = 0; i < this.config.min; i++) {
@@ -50,7 +51,7 @@ export class Discovery {
     this.acceptLoop();
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(drainTimeout = 30_000): Promise<void> {
     this.running = false;
 
     if (this.heartbeatTimer !== undefined) {
@@ -62,7 +63,7 @@ export class Discovery {
       this.scaleDownTimer = undefined;
     }
 
-    // Send shutdown to all peers
+    // Send shutdown to all peers — they will drain and disconnect
     for (const [processId] of this.peers) {
       const fc = this.peerFc.get(processId);
       if (fc) {
@@ -74,7 +75,23 @@ export class Discovery {
       }
     }
 
-    // Kill all managed processes
+    // Wait for peers to drain and disconnect gracefully
+    if (this.peers.size > 0) {
+      console.log(
+        `[Discovery] Waiting for ${this.peers.size} peer(s) to drain...`,
+      );
+      const deadline = Date.now() + drainTimeout;
+      while (this.peers.size > 0 && Date.now() < deadline) {
+        await new Promise<void>((r) => setTimeout(r, 200));
+      }
+      if (this.peers.size > 0) {
+        console.warn(
+          `[Discovery] Drain timeout reached, ${this.peers.size} peer(s) still connected.`,
+        );
+      }
+    }
+
+    // Kill all remaining managed processes
     for (const [, proc] of this.managedProcesses) {
       try {
         proc.kill("SIGTERM");
@@ -96,7 +113,7 @@ export class Discovery {
     // Wait for connection loops to finish
     await Promise.allSettled(this.connectionLoops);
 
-    // Close all peer connections
+    // Close all remaining peer connections
     for (const [, peer] of this.peers) {
       try {
         peer.conn.close();

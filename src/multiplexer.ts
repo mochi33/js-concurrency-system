@@ -22,8 +22,16 @@ export class Multiplexer {
   private unroutedHandler: UnroutedMessageHandler | null = null;
   private closed = false;
   private readLoopPromise: Promise<void> | null = null;
+  private onCloseCallback: (() => void) | null = null;
 
   constructor(private conn: FramedConnection) {}
+
+  /**
+   * Register a callback to be invoked when this multiplexer is closed.
+   */
+  onClose(callback: () => void): void {
+    this.onCloseCallback = callback;
+  }
 
   /**
    * Start the read loop. Must be called after construction.
@@ -95,6 +103,7 @@ export class Multiplexer {
       });
     }
     this.handlers.clear();
+    this.onCloseCallback?.();
   }
 
   private async readLoop(): Promise<void> {

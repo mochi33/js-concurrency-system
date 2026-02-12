@@ -11,6 +11,7 @@ function parseCliArgs(args: string[]): DiscoveryConfig {
   }
 
   const port = parseInt(parsed["port"] ?? "9876", 10);
+  const host = parsed["host"] ?? "127.0.0.1";
   const registry = parsed["registry"] ?? "./examples/tasks.ts";
   const min = parseInt(parsed["min"] ?? "2", 10);
   const max = parseInt(
@@ -20,7 +21,7 @@ function parseCliArgs(args: string[]): DiscoveryConfig {
   const overflowMax = parseInt(parsed["overflow-max"] ?? String(max), 10);
   const idleTimeout = parseInt(parsed["idle-timeout"] ?? "30000", 10);
 
-  return { port, registry, min, max, overflowMax, idleTimeout };
+  return { port, host, registry, min, max, overflowMax, idleTimeout };
 }
 
 async function main(): Promise<void> {
