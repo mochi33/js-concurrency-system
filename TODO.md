@@ -26,12 +26,11 @@
 
 ## Medium Priority（運用性・可観測性の向上）
 
-### 4. Registry の簡易記法（Record 形式）サポート
-- 現状: `new Registry()` + `register()` を繰り返す冗長な記述が必要
-- 必要: `export default { multiply: async (ctx, a, b) => a * b }` のような Record 形式で定義可能に
-- `Registry.from()` で Registry インスタンスと `Record<string, TaskFunction>` の両方を受け付ける
-- `node_main.ts` / `node.ts` の `connect()` のローディング箇所を対応
-- 従来の Registry 形式も引き続き動作させる（後方互換）
+### 4. ~~Registry の簡易記法（Record 形式）サポート~~ ✅
+- `Registry.from()` スタティックメソッドを追加: Registry インスタンスと `Record<string, TaskFunction>` の両方を受け付ける
+- `node_main.ts` / `node.ts` の `connect()` のローディング箇所で `Registry.from(mod.default)` を使用
+- 従来の Registry 形式も引き続き動作（後方互換）
+- `TaskRecord` 型を export して利用可能に
 
 ### 5. メッセージのランタイム型バリデーション
 - 現状: `deserialize()` が `JSON.parse() as Message` でキャストしており、ランタイムの型検証なし
@@ -156,3 +155,7 @@
 - [x] **Discovery bind address** — `DiscoveryConfig.host` + `--host` CLI フラグ。デフォルト `127.0.0.1`
 - [x] **Multiplexer メモリリーク修正** — `onClose` コールバックで `incomingMuxes` / `connectionPool` から自動削除
 - [x] **Discovery 再接続** — 指数バックオフ（1s〜30s）で自動再接続。再登録+capacity報告。再接続中のspawnは待機
+
+## 完了済み (Medium Priority)
+
+- [x] **Registry 簡易記法** — `Registry.from()` で `Record<string, TaskFunction>` と Registry インスタンスの両方を受け付け。`node_main.ts` / `connect()` 対応済み

@@ -32,13 +32,14 @@ async function main(): Promise<void> {
   console.log(`[NodeMain] Starting with config:`, config);
 
   // Dynamic import of the registry file
+  // Supports both `export default new Registry()` and `export default { fn: ... }` (Record form)
   let registry: Registry;
   try {
     const registryPath = config.registry.startsWith(".")
       ? new URL(config.registry, `file://${Deno.cwd()}/`).href
       : config.registry;
     const mod = await import(registryPath);
-    registry = mod.default as Registry;
+    registry = Registry.from(mod.default);
   } catch (e) {
     console.error(`[NodeMain] Failed to load registry "${config.registry}":`, e);
     Deno.exit(1);

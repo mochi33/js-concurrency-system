@@ -819,7 +819,7 @@ export async function connect(
 
   if (opts.registry) {
     const mod = await import(opts.registry);
-    registry = mod.default as Registry;
+    registry = Registry.from(mod.default);
   }
 
   const node = new ProcessNode(opts, registry);
