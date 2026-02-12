@@ -597,8 +597,7 @@ export class ProcessNode {
       return;
     }
 
-    const taskFn = this.registry.get(msg.func);
-    if (!taskFn) {
+    if (!this.registry.has(msg.func)) {
       mux.writeMessage({
         type: "reject",
         taskId: msg.taskId,
@@ -609,15 +608,41 @@ export class ProcessNode {
 
     // Accept - increment synchronously before any await
     this.activeTasks++;
-    this.executeTask(mux, msg, taskFn);
+    this.executeTask(mux, msg);
   }
 
   private async executeTask(
     mux: Multiplexer,
     msg: ExecMessage,
-    taskFn: TaskFunction,
   ): Promise<void> {
     this.notifyCapacityChange();
+
+    // Resolve the task function (lazy entries are imported here)
+    let taskFn: TaskFunction;
+    try {
+      const resolved = await this.registry.resolve(msg.func);
+      if (!resolved) {
+        this.activeTasks--;
+        this.notifyCapacityChange();
+        mux.writeMessage({
+          type: "error",
+          taskId: msg.taskId,
+          error: { message: `Failed to resolve "${msg.func}"`, name: "Error" },
+        }).catch(() => {});
+        return;
+      }
+      taskFn = resolved;
+    } catch (e: unknown) {
+      this.activeTasks--;
+      this.notifyCapacityChange();
+      const err = e instanceof Error ? e : new Error(String(e));
+      mux.writeMessage({
+        type: "error",
+        taskId: msg.taskId,
+        error: { message: err.message, name: err.name, stack: err.stack },
+      }).catch(() => {});
+      return;
+    }
 
     try {
       await mux.writeMessage({
