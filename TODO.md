@@ -33,18 +33,30 @@
 - `node_main.ts` / `node.ts` の `connect()` のローディング箇所を対応
 - 従来の Registry 形式も引き続き動作させる（後方互換）
 
-### 5. Discovery 再接続
+### 5. メッセージのランタイム型バリデーション
+- 現状: `deserialize()` が `JSON.parse() as Message` でキャストしており、ランタイムの型検証なし
+- 問題点:
+  - 不正な JSON がそのまま `Message` 型として通過する
+  - `msg as DiscoveryMessage` / `msg as P2PMessage` の接続種別キャストも unsafe
+  - switch の `default` ケースが網羅性チェック（exhaustiveness check）を無効化
+  - Multiplexer が `taskId` の有無だけでルーティングし、`type` を確認しない
+- 対応:
+  - `deserialize()` に型ガード or スキーマバリデーション（zod 等）を導入
+  - 接続種別ごとに型を分離（Discovery 接続は `DiscoveryMessage` のみ受信）
+  - switch の `default` を `never` 型チェックに置換して網羅性を保証
+
+### 6. Discovery 再接続
 - 現状: Discovery が落ちるとノードが切断され、復旧不可
 - Discovery 再起動時の自動再接続が必要
 - 本番稼働率に直結
 
-### 6. 構造化ログ + Request ID トラッキング
+### 7. 構造化ログ + Request ID トラッキング
 - 現状: `console.log` のみ、トレーサビリティなし
 - 必要: 全ログに `taskId` を含める
 - フォーマット例: `[2024-02-11T10:00:00Z] [task=abc123] exec fibonacci on node-1`
 - デバッグ効率を大幅に改善
 
-### 7. メトリクス & Observability
+### 8. メトリクス & Observability
 - Discovery が公開すべき情報:
   - ノード数・アクティブタスク数
   - タスク完了レイテンシ (p50, p95, p99)
@@ -56,24 +68,24 @@
 
 ## Low Priority（拡張機能・Nice-to-have）
 
-### 8. Fan-out / Map-Reduce パターン
+### 9. Fan-out / Map-Reduce パターン
 - 同じタスクを全ノードに spawn して結果を集約
 - 例: `const results = await caller.fanout("search", [query], { merge: "concat" })`
 
-### 9. Sticky Routing（Affinity）
+### 10. Sticky Routing（Affinity）
 - 同じキー（userId 等）を一貫して同じノードにルーティング
 - ノードローカルキャッシュの活用が可能
 - 例: `spawn("getUserProfile", [userId], { affinity: userId })`
 
-### 10. タスク優先度
+### 11. タスク優先度
 - 例: `spawn("urgent_task", [data], { priority: "high" })`
 - Discovery がルーティング時に高優先タスクを優先
 
-### 11. Pure Function のリザルトキャッシュ
+### 12. Pure Function のリザルトキャッシュ
 - 関数を pure とマーク: `registry.register("fibonacci", fn, { pure: true, cacheTTL: 60_000 })`
 - 同じ引数 → キャッシュ済み結果を即座に返却
 
-### 12. Binary Protocol（MessagePack）
+### 13. Binary Protocol（MessagePack）
 - JSON を MessagePack に置き換え
 - 大きなデータ転送時に特に有効
 - シリアライズ/デシリアライズの高速化 + 転送サイズ削減
