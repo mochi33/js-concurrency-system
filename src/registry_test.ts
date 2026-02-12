@@ -158,6 +158,26 @@ console.log("\nTest 8: Registry.from — works with sync functions in Record");
   assert(result === 30, `syncAdd(10, 20) = 30 (got ${result})`);
 }
 
+// ── Test 9: Rejects non-function values in Record ──
+console.log("\nTest 9: Registry.from — rejects non-function values");
+{
+  // deno-lint-ignore no-explicit-any
+  const bad = { multiply: async () => 1, VERSION: "1.0.0" as any };
+  assertThrows(
+    () => Registry.from(bad),
+    '"VERSION" is not a function',
+    "throws on string property",
+  );
+
+  // deno-lint-ignore no-explicit-any
+  const bad2 = { count: 42 as any };
+  assertThrows(
+    () => Registry.from(bad2),
+    '"count" is not a function',
+    "throws on number property",
+  );
+}
+
 // ── Results ──
 console.log(`\n========================================`);
 console.log(`Registry Tests: ${passed} passed, ${failed} failed`);

@@ -18,8 +18,13 @@ export class Registry {
       return source;
     }
     const registry = new Registry();
-    for (const [name, fn] of Object.entries(source)) {
-      registry.register(name, fn);
+    for (const [name, value] of Object.entries(source)) {
+      if (typeof value !== "function") {
+        throw new Error(
+          `Registry.from: "${name}" is not a function (got ${typeof value})`,
+        );
+      }
+      registry.register(name, value as TaskFunction);
     }
     return registry;
   }
