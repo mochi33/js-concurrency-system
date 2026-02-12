@@ -17,6 +17,11 @@ export class Registry {
     if (source instanceof Registry) {
       return source;
     }
+    if (source == null || typeof source !== "object") {
+      throw new Error(
+        `Registry.from: expected a Registry or Record<string, TaskFunction>, got ${typeof source}`,
+      );
+    }
     const registry = new Registry();
     for (const [name, value] of Object.entries(source)) {
       if (typeof value !== "function") {

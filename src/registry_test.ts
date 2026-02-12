@@ -178,6 +178,38 @@ console.log("\nTest 9: Registry.from — rejects non-function values");
   );
 }
 
+// ── Test 10: Rejects non-object sources ──
+console.log("\nTest 10: Registry.from — rejects non-object sources");
+{
+  // deno-lint-ignore no-explicit-any
+  assertThrows(
+    () => Registry.from(null as any),
+    "expected a Registry or Record",
+    "throws on null",
+  );
+
+  // deno-lint-ignore no-explicit-any
+  assertThrows(
+    () => Registry.from("hello" as any),
+    "expected a Registry or Record",
+    "throws on string",
+  );
+
+  // deno-lint-ignore no-explicit-any
+  assertThrows(
+    () => Registry.from(42 as any),
+    "expected a Registry or Record",
+    "throws on number",
+  );
+
+  // deno-lint-ignore no-explicit-any
+  assertThrows(
+    () => Registry.from(undefined as any),
+    "expected a Registry or Record",
+    "throws on undefined",
+  );
+}
+
 // ── Results ──
 console.log(`\n========================================`);
 console.log(`Registry Tests: ${passed} passed, ${failed} failed`);
