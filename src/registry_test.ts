@@ -210,59 +210,8 @@ console.log("\nTest 10: Registry.from — rejects non-object sources");
   );
 }
 
-// ── Test 11: lazy() registers name and shows in list() ──
-console.log("\nTest 11: Registry — lazy() registers name and shows in list()");
-{
-  const registry = new Registry();
-  registry.lazy("lazyFn", async () => async () => 42);
-
-  assert(registry.list().includes("lazyFn"), "list() includes lazyFn");
-  assert(registry.has("lazyFn"), "has('lazyFn') is true");
-  assert(registry.get("lazyFn") === undefined, "get('lazyFn') is undefined before resolve");
-}
-
-// ── Test 12: resolve() loads and caches lazy entry ──
-console.log("\nTest 12: Registry — resolve() loads and caches lazy entry");
-{
-  let loadCount = 0;
-  const registry = new Registry();
-  registry.lazy("lazyMul", async () => {
-    loadCount++;
-    return async (_ctx: Context, ...args: unknown[]) =>
-      (args[0] as number) * (args[1] as number);
-  });
-
-  const fn = await registry.resolve("lazyMul");
-  assert(typeof fn === "function", "resolve returns a function");
-  assert(loadCount === 1, "loader called once");
-
-  const result = await fn!(dummyCtx, 5, 6);
-  assert(result === 30, `lazyMul(5, 6) = 30 (got ${result})`);
-
-  // Second resolve returns cached — loader not called again
-  const fn2 = await registry.resolve("lazyMul");
-  assert(fn === fn2, "second resolve returns same reference");
-  assert(loadCount === 1, "loader still called only once");
-
-  // After resolve, get() also works
-  assert(registry.get("lazyMul") === fn, "get() works after resolve");
-}
-
-// ── Test 13: resolve() works with module-style default export ──
-console.log("\nTest 13: Registry — resolve() works with { default: fn } return");
-{
-  const registry = new Registry();
-  const taskFn = async (_ctx: Context, ...args: unknown[]) =>
-    (args[0] as number) + 1;
-
-  registry.lazy("inc", async () => ({ default: taskFn }));
-
-  const resolved = await registry.resolve("inc");
-  assert(resolved === taskFn, "resolved to the default export function");
-}
-
-// ── Test 14: resolve() for eager entries works ──
-console.log("\nTest 14: Registry — resolve() works for eager entries too");
+// ── Test 11: resolve() for eager entries works ──
+console.log("\nTest 11: Registry — resolve() works for eager entries too");
 {
   const registry = new Registry();
   const fn = async () => 99;
@@ -272,67 +221,16 @@ console.log("\nTest 14: Registry — resolve() works for eager entries too");
   assert(resolved === fn, "resolve returns the eager function");
 }
 
-// ── Test 15: resolve() returns undefined for unknown names ──
-console.log("\nTest 15: Registry — resolve() returns undefined for unknown names");
+// ── Test 12: resolve() returns undefined for unknown names ──
+console.log("\nTest 12: Registry — resolve() returns undefined for unknown names");
 {
   const registry = new Registry();
   const resolved = await registry.resolve("nope");
   assert(resolved === undefined, "resolve returns undefined");
 }
 
-// ── Test 16: lazy() rejects duplicates ──
-console.log("\nTest 16: Registry — lazy() rejects duplicate names");
-{
-  const registry = new Registry();
-  registry.lazy("dup", async () => async () => 1);
-
-  assertThrows(
-    () => registry.lazy("dup", async () => async () => 2),
-    'Function "dup" is already registered',
-    "throws on duplicate lazy registration",
-  );
-
-  // Also conflicts with eager registration
-  const registry2 = new Registry();
-  registry2.register("x", async () => 1);
-
-  assertThrows(
-    () => registry2.lazy("x", async () => async () => 2),
-    'Function "x" is already registered',
-    "throws when lazy conflicts with eager",
-  );
-}
-
-// ── Test 17: list() returns both eager and lazy names ──
-console.log("\nTest 17: Registry — list() returns both eager and lazy names");
-{
-  const registry = new Registry();
-  registry.register("eager1", async () => 1);
-  registry.lazy("lazy1", async () => async () => 2);
-  registry.register("eager2", async () => 3);
-  registry.lazy("lazy2", async () => async () => 4);
-
-  const names = registry.list().sort();
-  assert(
-    JSON.stringify(names) === JSON.stringify(["eager1", "eager2", "lazy1", "lazy2"]),
-    "list() returns all 4 names",
-  );
-}
-
-// ── Test 18: has() works for both eager and lazy ──
-console.log("\nTest 18: Registry — has() works for both eager and lazy");
-{
-  const registry = new Registry();
-  registry.register("a", async () => 1);
-  registry.lazy("b", async () => async () => 2);
-
-  assert(registry.has("a"), "has('a') is true (eager)");
-  assert(registry.has("b"), "has('b') is true (lazy)");
-  assert(!registry.has("c"), "has('c') is false (not registered)");
-}
-
-// ── Test 19: fromDirectory() scans directory and registers lazily ──
-console.log("\nTest 19: Registry — fromDirectory() scans directory and registers lazily");
+// ── Test 13: fromDirectory() scans directory and registers lazily ──
+console.log("\nTest 13: Registry — fromDirectory() scans directory and registers lazily");
 {
   // Create a temp directory with task files
   const tmpDir = await Deno.makeTempDir();

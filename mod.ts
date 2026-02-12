@@ -1,6 +1,5 @@
 export { connect, ProcessNode } from "./src/node.ts";
 export { Registry } from "./src/registry.ts";
-export type { TaskLoader } from "./src/registry.ts";
 export { Discovery } from "./src/discovery.ts";
 export { createChannel } from "./src/channel.ts";
 export { createContext } from "./src/context.ts";

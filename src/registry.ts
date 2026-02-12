@@ -3,7 +3,7 @@ import type { TaskFunction } from "./types.ts";
 export type TaskRecord = Record<string, TaskFunction>;
 
 // deno-lint-ignore no-explicit-any
-export type TaskLoader = () => Promise<{ default: TaskFunction } | { [key: string]: any }>;
+type TaskLoader = () => Promise<{ default: TaskFunction } | { [key: string]: any }>;
 
 export class Registry {
   private fns = new Map<string, TaskFunction>();
@@ -48,17 +48,7 @@ export class Registry {
     this.fns.set(name, fn);
   }
 
-  /**
-   * Register a task function lazily. The loader is called only on first
-   * execution and the result is cached.
-   *
-   * The loader should return a module with a default export (TaskFunction),
-   * or return a TaskFunction directly.
-   *
-   * Usage:
-   *   registry.lazy("heavyCalc", () => import("./tasks/heavy_calc.ts"));
-   */
-  lazy(name: string, loader: TaskLoader): void {
+  private lazy(name: string, loader: TaskLoader): void {
     if (this.fns.has(name) || this.loaders.has(name)) {
       throw new Error(`Function "${name}" is already registered`);
     }
