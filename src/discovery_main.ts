@@ -1,5 +1,8 @@
 import { Discovery } from "./discovery.ts";
+import { Logger } from "./logger.ts";
 import type { DiscoveryConfig } from "./types.ts";
+
+const log = new Logger({ fields: { component: "discovery_main" } });
 
 function parseCliArgs(args: string[]): DiscoveryConfig {
   const parsed: Record<string, string> = {};
@@ -20,19 +23,22 @@ function parseCliArgs(args: string[]): DiscoveryConfig {
   );
   const overflowMax = parseInt(parsed["overflow-max"] ?? String(max), 10);
   const idleTimeout = parseInt(parsed["idle-timeout"] ?? "30000", 10);
+  const metricsPort = parsed["metrics-port"]
+    ? parseInt(parsed["metrics-port"], 10)
+    : undefined;
 
-  return { port, host, registry, min, max, overflowMax, idleTimeout };
+  return { port, host, registry, min, max, overflowMax, idleTimeout, metricsPort };
 }
 
 async function main(): Promise<void> {
   const config = parseCliArgs(Deno.args);
-  console.log("[Discovery] Config:", config);
+  log.info(`Config: port=${config.port} min=${config.min} max=${config.max}`);
 
   const discovery = new Discovery(config);
   await discovery.start();
 
   const onSignal = async () => {
-    console.log("\n[Discovery] Received signal, shutting down...");
+    log.info("Received signal, shutting down");
     await discovery.shutdown();
     Deno.exit(0);
   };
@@ -46,6 +52,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error("[Discovery] Fatal error:", e);
+  log.error(`Fatal error: ${e}`);
   Deno.exit(1);
 });

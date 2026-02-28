@@ -3,8 +3,12 @@
     "strict": true,
     "noUncheckedIndexedAccess": true
   },
+  "imports": {
+    "zod": "npm:zod@^3.24"
+  },
   "tasks": {
     "discovery": "deno run --allow-net --allow-run --allow-read src/discovery_main.ts",
-    "example": "deno run --allow-net --allow-run --allow-read examples/main.ts"
+    "example": "deno run --allow-net --allow-run --allow-read examples/main.ts",
+    "finance": "deno run --allow-net --allow-run --allow-read examples/finance/main.ts"
   }
 }

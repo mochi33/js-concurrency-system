@@ -1,9 +1,13 @@
 import { FramedConnection } from "./protocol.ts";
+import { assertNever } from "./schemas.ts";
+import { MetricsCollector } from "./metrics.ts";
+import { Logger } from "./logger.ts";
 import type {
   CapacityChangeMessage,
   DiscoveryConfig,
   DiscoveryMessage,
   FindMessage,
+  MetricsSnapshot,
   PeerState,
   RegisterMessage,
 } from "./types.ts";
@@ -13,6 +17,7 @@ interface PendingFind {
   exclude: string[];
   conn: FramedConnection;
   processId: string;
+  startTime: number;
 }
 
 export class Discovery {
@@ -27,6 +32,9 @@ export class Discovery {
   private scaleDownTimer: number | undefined = undefined;
   private running = false;
   private connectionLoops: Promise<void>[] = [];
+  private metricsCollector = new MetricsCollector();
+  private metricsServer: Deno.HttpServer | null = null;
+  private log = new Logger({ fields: { component: "discovery" } });
 
   constructor(private config: DiscoveryConfig) {}
 
@@ -34,7 +42,7 @@ export class Discovery {
     this.running = true;
     const host = this.config.host ?? "127.0.0.1";
     this.listener = Deno.listen({ hostname: host, port: this.config.port });
-    console.log(`[Discovery] Listening on ${host}:${this.config.port}`);
+    this.log.info(`Listening on ${host}:${this.config.port}`);
 
     // Spawn initial min processes
     for (let i = 0; i < this.config.min; i++) {
@@ -47,8 +55,48 @@ export class Discovery {
     // Start scale-down loop
     this.scaleDownTimer = setInterval(() => this.scaleDownLoop(), 10_000);
 
+    // Start optional metrics HTTP server
+    if (this.config.metricsPort) {
+      this.startMetricsServer(this.config.metricsPort);
+    }
+
     // Accept connections
     this.acceptLoop();
+  }
+
+  getMetrics(): MetricsSnapshot {
+    this.updateGauges();
+    return this.metricsCollector.getMetrics();
+  }
+
+  getMetricsPrometheus(): string {
+    this.updateGauges();
+    return this.metricsCollector.toPrometheus();
+  }
+
+  private updateGauges(): void {
+    this.metricsCollector.setActiveNodeCount(this.peers.size);
+    let totalActive = 0;
+    for (const [, peer] of this.peers) {
+      totalActive += peer.activeTasks;
+    }
+    this.metricsCollector.setActiveTaskCount(totalActive);
+    this.metricsCollector.setQueueDepth(this.queue.length);
+  }
+
+  private startMetricsServer(port: number): void {
+    const host = this.config.host ?? "127.0.0.1";
+    this.metricsServer = Deno.serve(
+      { hostname: host, port, onListen: () => {
+        this.log.info(`Metrics server on ${host}:${port}`);
+      }},
+      (_req: Request) => {
+        const body = this.getMetricsPrometheus();
+        return new Response(body, {
+          headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" },
+        });
+      },
+    );
   }
 
   async shutdown(drainTimeout = 30_000): Promise<void> {
@@ -77,17 +125,13 @@ export class Discovery {
 
     // Wait for peers to drain and disconnect gracefully
     if (this.peers.size > 0) {
-      console.log(
-        `[Discovery] Waiting for ${this.peers.size} peer(s) to drain...`,
-      );
+      this.log.info(`Waiting for ${this.peers.size} peer(s) to drain`);
       const deadline = Date.now() + drainTimeout;
       while (this.peers.size > 0 && Date.now() < deadline) {
         await new Promise<void>((r) => setTimeout(r, 200));
       }
       if (this.peers.size > 0) {
-        console.warn(
-          `[Discovery] Drain timeout reached, ${this.peers.size} peer(s) still connected.`,
-        );
+        this.log.warn(`Drain timeout reached, ${this.peers.size} peer(s) still connected`);
       }
     }
 
@@ -128,7 +172,13 @@ export class Discovery {
     this.overflowIds.clear();
     this.queue = [];
 
-    console.log("[Discovery] Shut down.");
+    // Shut down metrics server
+    if (this.metricsServer) {
+      await this.metricsServer.shutdown();
+      this.metricsServer = null;
+    }
+
+    this.log.info("Shut down");
   }
 
   private async acceptLoop(): Promise<void> {
@@ -148,12 +198,12 @@ export class Discovery {
   private async handleConnection(fc: FramedConnection): Promise<void> {
     try {
       while (this.running && !fc.isClosed) {
-        const msg = await fc.readMessage();
+        const msg = await fc.readDiscoveryMessage();
         if (msg === null) break;
-        await this.handleMessage(fc, msg as DiscoveryMessage);
+        await this.handleMessage(fc, msg);
       }
     } catch {
-      // connection error
+      // connection error (includes validation errors from malformed messages)
     } finally {
       this.handleDisconnect(fc);
     }
@@ -182,9 +232,16 @@ export class Discovery {
       case "bye":
         this.handleBye(fc);
         break;
-      default:
-        // Ignore unknown messages
+      // Discovery receives these types but doesn't need to handle them
+      // (they are sent by Discovery, not received from peers in normal flow)
+      case "registered":
+      case "found":
+      case "spawn_result":
+      case "heartbeat":
+      case "shutdown":
         break;
+      default:
+        assertNever(msg);
     }
   }
 
@@ -211,8 +268,9 @@ export class Discovery {
     this.peerFc.set(msg.processId, fc);
 
     await fc.writeMessage({ type: "registered", processId: msg.processId });
-    console.log(
-      `[Discovery] Registered peer ${msg.processId} at ${msg.host}:${msg.port} (funcs: ${msg.funcs.join(", ")})`,
+    this.metricsCollector.setActiveNodeCount(this.peers.size);
+    this.log.info(
+      `Registered peer ${msg.processId.slice(0, 8)} at ${msg.host}:${msg.port} (funcs: ${msg.funcs.join(", ")})`,
     );
 
     // Check if any pending find requests can now be fulfilled
@@ -245,6 +303,7 @@ export class Discovery {
     fc: FramedConnection,
     msg: FindMessage,
   ): Promise<void> {
+    const findStart = Date.now();
     const requesterId = this.peersByConn.get(fc);
     const exclude = new Set(msg.exclude ?? []);
 
@@ -252,6 +311,8 @@ export class Discovery {
     const candidates = this.findAvailablePeers(msg.func, exclude);
 
     if (candidates.length > 0) {
+      this.metricsCollector.recordTaskSpawned();
+      this.metricsCollector.recordSpawnWait(Date.now() - findStart);
       await fc.writeMessage({
         type: "found",
         peers: candidates.map((p) => ({
@@ -277,7 +338,9 @@ export class Discovery {
           exclude: [...exclude],
           conn: fc,
           processId: requesterId ?? "",
+          startTime: findStart,
         });
+        this.metricsCollector.setQueueDepth(this.queue.length);
         return;
       }
     }
@@ -293,13 +356,16 @@ export class Discovery {
             exclude: [...exclude],
             conn: fc,
             processId: requesterId ?? "",
+            startTime: findStart,
           });
+          this.metricsCollector.setQueueDepth(this.queue.length);
           return;
         }
       }
     }
 
     // Cannot spawn or no room - return empty
+    this.metricsCollector.recordRejection("at_capacity");
     await fc.writeMessage({ type: "found", peers: [] });
   }
 
@@ -342,7 +408,7 @@ export class Discovery {
   private handleBye(fc: FramedConnection): void {
     const processId = this.peersByConn.get(fc);
     if (processId) {
-      console.log(`[Discovery] Peer ${processId} sent bye.`);
+      this.log.info(`Peer ${processId.slice(0, 8)} sent bye`);
       this.removePeer(processId);
     }
     fc.close();
@@ -351,7 +417,7 @@ export class Discovery {
   private handleDisconnect(fc: FramedConnection): void {
     const processId = this.peersByConn.get(fc);
     if (processId) {
-      console.log(`[Discovery] Peer ${processId} disconnected.`);
+      this.log.info(`Peer ${processId.slice(0, 8)} disconnected`);
       this.removePeer(processId);
     }
     this.peersByConn.delete(fc);
@@ -362,6 +428,7 @@ export class Discovery {
     const peer = this.peers.get(processId);
     this.peers.delete(processId);
     this.peerFc.delete(processId);
+    this.metricsCollector.setActiveNodeCount(this.peers.size);
     if (peer) {
       for (const [fc, pid] of this.peersByConn) {
         if (pid === processId) {
@@ -417,6 +484,8 @@ export class Discovery {
       const exclude = new Set(pending.exclude);
       const candidates = this.findAvailablePeers(pending.func, exclude);
       if (candidates.length > 0 && !pending.conn.isClosed) {
+        this.metricsCollector.recordTaskSpawned();
+        this.metricsCollector.recordSpawnWait(Date.now() - pending.startTime);
         pending.conn
           .writeMessage({
             type: "found",
@@ -434,6 +503,7 @@ export class Discovery {
       }
     }
     this.queue = remaining;
+    this.metricsCollector.setQueueDepth(this.queue.length);
   }
 
   private async spawnProcess(overflow: boolean): Promise<boolean> {
@@ -462,12 +532,13 @@ export class Discovery {
       if (overflow) {
         this.overflowIds.add(processId);
       }
-      console.log(
-        `[Discovery] Spawned ${overflow ? "overflow " : ""}process ${processId}`,
+      this.metricsCollector.recordProcessSpawn();
+      this.log.info(
+        `Spawned ${overflow ? "overflow " : ""}process ${processId.slice(0, 8)}`,
       );
       return true;
     } catch (e) {
-      console.error(`[Discovery] Failed to spawn process: ${e}`);
+      this.log.error(`Failed to spawn process: ${e}`);
       return false;
     }
   }
@@ -488,9 +559,7 @@ export class Discovery {
 
     for (const [processId, peer] of this.peers) {
       if (now - peer.lastHeartbeat > 45_000) {
-        console.log(
-          `[Discovery] Peer ${processId} heartbeat timeout. Removing.`,
-        );
+        this.log.warn(`Peer ${processId.slice(0, 8)} heartbeat timeout, removing`);
         deadPeers.push(processId);
         continue;
       }
@@ -525,9 +594,7 @@ export class Discovery {
 
       if (peer.overflow) {
         // Overflow processes are shut down immediately when idle
-        console.log(
-          `[Discovery] Shutting down idle overflow process ${processId}`,
-        );
+        this.log.info(`Shutting down idle overflow process ${processId.slice(0, 8)}`);
         this.sendShutdown(peer);
         continue;
       }
@@ -537,9 +604,7 @@ export class Discovery {
         this.managedNonOverflowCount() > this.config.min &&
         now - peer.idleSince > this.config.idleTimeout
       ) {
-        console.log(
-          `[Discovery] Shutting down idle process ${processId} (idle for ${now - peer.idleSince}ms)`,
-        );
+        this.log.info(`Shutting down idle process ${processId.slice(0, 8)} (idle for ${now - peer.idleSince}ms)`);
         this.sendShutdown(peer);
       }
     }

@@ -1,4 +1,11 @@
 import type { Message } from "./types.ts";
+import {
+  parseDiscoveryMessage,
+  parseP2PMessage,
+  type ParsedDiscoveryMessage,
+  type ParsedP2PMessage,
+} from "./schemas.ts";
+import { ObjectRef } from "./object_store.ts";
 
 const MAX_MESSAGE_SIZE = 16 * 1024 * 1024; // 16 MiB
 const LENGTH_PREFIX_SIZE = 4;
@@ -31,6 +38,9 @@ function replacer(_key: string, value: unknown): unknown {
   }
   if (value instanceof ArrayBuffer) {
     return { $type: "ArrayBuffer", base64: encodeBase64(new Uint8Array(value)) };
+  }
+  if (value instanceof ObjectRef) {
+    return { $type: "ObjectRef", id: value.id, size: value.size, ownerHost: value.ownerHost, ownerPort: value.ownerPort };
   }
   // Escape user data that has $type key
   if (
@@ -70,6 +80,13 @@ function reviver(_key: string, value: unknown): unknown {
           return decodeBase64(obj.base64 as string);
         case "ArrayBuffer":
           return decodeBase64(obj.base64 as string).buffer;
+        case "ObjectRef": {
+          if (typeof obj.id !== "string" || typeof obj.size !== "number" ||
+              typeof obj.ownerHost !== "string" || typeof obj.ownerPort !== "number") {
+            throw new Error("Invalid ObjectRef in deserialized message");
+          }
+          return new ObjectRef(obj.id, obj.size, obj.ownerHost, obj.ownerPort);
+        }
       }
     }
     // Unescape $$type back to $type
@@ -119,6 +136,18 @@ export function deserialize(data: Uint8Array): Message {
   return JSON.parse(json, reviver) as Message;
 }
 
+export function deserializeDiscovery(data: Uint8Array): ParsedDiscoveryMessage {
+  const json = new TextDecoder().decode(data);
+  const raw = JSON.parse(json, reviver);
+  return parseDiscoveryMessage(raw);
+}
+
+export function deserializeP2P(data: Uint8Array): ParsedP2PMessage {
+  const json = new TextDecoder().decode(data);
+  const raw = JSON.parse(json, reviver);
+  return parseP2PMessage(raw);
+}
+
 // ============================================================
 // Frame encoding: 4-byte length prefix + payload
 // ============================================================
@@ -147,7 +176,7 @@ export class FramedConnection {
 
   constructor(private conn: Deno.Conn) {}
 
-  async readMessage(): Promise<Message | null> {
+  private async readPayload(): Promise<Uint8Array | null> {
     // Read until we have enough data for length prefix
     while (this.buffer.length < LENGTH_PREFIX_SIZE) {
       if (this.closed) return null;
@@ -185,10 +214,22 @@ export class FramedConnection {
       this.buffer = concat(this.buffer, chunk);
     }
 
-    // Extract and deserialize
+    // Extract payload
     const payload = this.buffer.slice(LENGTH_PREFIX_SIZE, totalNeeded);
     this.buffer = this.buffer.slice(totalNeeded);
-    return deserialize(payload);
+    return payload;
+  }
+
+  async readDiscoveryMessage(): Promise<ParsedDiscoveryMessage | null> {
+    const payload = await this.readPayload();
+    if (payload === null) return null;
+    return deserializeDiscovery(payload);
+  }
+
+  async readP2PMessage(): Promise<ParsedP2PMessage | null> {
+    const payload = await this.readPayload();
+    if (payload === null) return null;
+    return deserializeP2P(payload);
   }
 
   async writeMessage(msg: Message): Promise<void> {

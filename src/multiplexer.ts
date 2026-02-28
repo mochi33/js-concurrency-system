@@ -109,7 +109,7 @@ export class Multiplexer {
   private async readLoop(): Promise<void> {
     try {
       while (!this.closed && !this.conn.isClosed) {
-        const msg = await this.conn.readMessage();
+        const msg = await this.conn.readP2PMessage();
         if (msg === null) {
           this.close();
           return;

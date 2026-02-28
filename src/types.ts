@@ -177,6 +177,63 @@ export interface CancelMessage {
   taskId: string;
 }
 
+export interface ObjectFetchMessage {
+  type: "object_fetch";
+  taskId: string;
+  objectId: string;
+}
+
+export interface ObjectFetchResponseMessage {
+  type: "object_fetch_response";
+  taskId: string;
+  objectId: string;
+  found: boolean;
+  data: unknown;
+}
+
+// ============================================================
+// Actor P2P messages
+// ============================================================
+
+export interface ActorCreateMessage {
+  type: "actor_create";
+  taskId: string;
+  actorName: string;
+}
+
+export interface ActorCreateResultMessage {
+  type: "actor_create_result";
+  taskId: string;
+  actorId?: string;
+  error?: SerializedError;
+}
+
+export interface ActorCallMessage {
+  type: "actor_call";
+  taskId: string;
+  actorId: string;
+  method: string;
+  args: unknown[];
+}
+
+export interface ActorResultMessage {
+  type: "actor_result";
+  taskId: string;
+  value: unknown;
+}
+
+export interface ActorErrorMessage {
+  type: "actor_error";
+  taskId: string;
+  error: SerializedError;
+}
+
+export interface ActorDestroyMessage {
+  type: "actor_destroy";
+  taskId: string;
+  actorId: string;
+}
+
 export type P2PMessage =
   | ExecMessage
   | AcceptMessage
@@ -184,7 +241,15 @@ export type P2PMessage =
   | SendMessage
   | ResultMessage
   | ErrorMessage
-  | CancelMessage;
+  | CancelMessage
+  | ObjectFetchMessage
+  | ObjectFetchResponseMessage
+  | ActorCreateMessage
+  | ActorCreateResultMessage
+  | ActorCallMessage
+  | ActorResultMessage
+  | ActorErrorMessage
+  | ActorDestroyMessage;
 
 // ============================================================
 // Union of all messages
@@ -207,6 +272,7 @@ export interface DiscoveryConfig extends ScalingConfig {
   port: number;
   host?: string;
   registry: string;
+  metricsPort?: number;
 }
 
 export interface NodeConfig {
@@ -268,8 +334,49 @@ export interface Context {
 }
 
 // ============================================================
+// Actor types
+// ============================================================
+
+export interface ActorHandle {
+  readonly actorId: string;
+  call(method: string, ...args: unknown[]): Promise<unknown>;
+  destroy(): Promise<void>;
+}
+
+// deno-lint-ignore no-explicit-any
+export type ActorClass = new () => any;
+
+// ============================================================
 // Task function type
 // ============================================================
 
 // deno-lint-ignore no-explicit-any
 export type TaskFunction = (ctx: Context, ...args: any[]) => any;
+
+export type TaskRecord = Record<string, TaskFunction>;
+
+// ============================================================
+// Metrics types
+// ============================================================
+
+export interface MetricsSnapshot {
+  tasksSpawned: number;
+  tasksCompleted: number;
+  tasksFailed: number;
+  tasksRejectedAtCapacity: number;
+  tasksRejectedUnknownFunc: number;
+  activeNodeCount: number;
+  activeTaskCount: number;
+  queueDepth: number;
+  processSpawnCount: number;
+  latencyP50: number;
+  latencyP95: number;
+  latencyP99: number;
+  latencyCount: number;
+  latencySum: number;
+  spawnWaitP50: number;
+  spawnWaitP95: number;
+  spawnWaitP99: number;
+  spawnWaitCount: number;
+  spawnWaitSum: number;
+}

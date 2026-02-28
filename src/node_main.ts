@@ -1,6 +1,9 @@
-import { ProcessNode } from "./node.ts";
+import { ProcessNode, toRegistry } from "./node.ts";
 import { Registry } from "./registry.ts";
+import { Logger } from "./logger.ts";
 import type { NodeConfig } from "./types.ts";
+
+const log = new Logger({ fields: { component: "node_main" } });
 
 function parseCliArgs(args: string[]): NodeConfig & {
   registry: string;
@@ -29,7 +32,7 @@ function parseCliArgs(args: string[]): NodeConfig & {
 
 async function main(): Promise<void> {
   const config = parseCliArgs(Deno.args);
-  console.log(`[NodeMain] Starting with config:`, config);
+  log.info(`Starting with discovery=${config.discoveryHost}:${config.discoveryPort} listen=${config.listenHost}:${config.listenPort}`);
 
   // Dynamic import of the registry file
   let registry: Registry;
@@ -38,9 +41,12 @@ async function main(): Promise<void> {
       ? new URL(config.registry, `file://${Deno.cwd()}/`).href
       : config.registry;
     const mod = await import(registryPath);
-    registry = mod.default as Registry;
+    if (mod.default == null) {
+      throw new Error(`Registry module has no default export`);
+    }
+    registry = toRegistry(mod.default);
   } catch (e) {
-    console.error(`[NodeMain] Failed to load registry "${config.registry}":`, e);
+    log.error(`Failed to load registry "${config.registry}": ${e}`);
     Deno.exit(1);
   }
 
@@ -59,7 +65,7 @@ async function main(): Promise<void> {
   await node.start();
 
   const onSignal = async () => {
-    console.log(`\n[NodeMain] Received signal, shutting down...`);
+    log.info("Received signal, shutting down");
     await node.close();
     Deno.exit(0);
   };
@@ -73,6 +79,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  console.error("[NodeMain] Fatal error:", e);
+  log.error(`Fatal error: ${e}`);
   Deno.exit(1);
 });

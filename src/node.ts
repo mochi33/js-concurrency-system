@@ -3,21 +3,32 @@ import { Multiplexer } from "./multiplexer.ts";
 import { createChannel } from "./channel.ts";
 import { createContext } from "./context.ts";
 import { Registry } from "./registry.ts";
+import { ActorInstance, requestActorCreation } from "./actor.ts";
+import { Logger } from "./logger.ts";
+import { assertNever } from "./schemas.ts";
+import { ObjectRef, ObjectStore } from "./object_store.ts";
 import type {
+  ActorCallMessage,
+  ActorCreateMessage,
+  ActorDestroyMessage,
+  ActorHandle,
   Channel,
   DiscoveryMessage,
   ExecMessage,
   FoundMessage,
   NodeConfig,
+  ObjectFetchMessage,
   P2PMessage,
   PeerInfo,
   ReceiveResult,
-  RegisteredMessage,
   SpawnOptions,
   SpawnResultMessage,
   TaskFunction,
+  TaskRecord,
 } from "./types.ts";
 import { ExecTimeoutError, SpawnError, SpawnTimeoutError } from "./types.ts";
+import { MetricsCollector } from "./metrics.ts";
+import type { MetricsSnapshot } from "./types.ts";
 
 const DEFAULT_SPAWN_TIMEOUT = 30_000;
 const DEFAULT_MAX_CONCURRENCY = 4;
@@ -57,6 +68,10 @@ export class ProcessNode {
   private reconnectedPromise: Promise<void> | null = null;
   private reconnectedResolve: (() => void) | null = null;
   private reconnectLoopPromise: Promise<void> | null = null;
+  private actorInstances = new Map<string, ActorInstance>();
+  private nodeMetrics = new MetricsCollector();
+  private objectStore: ObjectStore;
+  private log: Logger;
 
   constructor(
     private config: NodeConfig,
@@ -67,6 +82,10 @@ export class ProcessNode {
     this.listenHost = config.listenHost ?? "127.0.0.1";
     this.listenPort = config.listenPort ?? 0;
     this.maxConcurrency = config.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY;
+    this.objectStore = new ObjectStore(this.listenHost, 0);
+    this.log = new Logger({
+      fields: { component: "node", node: this.processId.slice(0, 8) },
+    });
   }
 
   async start(): Promise<void> {
@@ -80,9 +99,8 @@ export class ProcessNode {
     // Get the actual port if 0 was specified
     const addr = this.listener.addr as Deno.NetAddr;
     this.listenPort = addr.port;
-    console.log(
-      `[Node ${this.processId}] Listening on ${this.listenHost}:${this.listenPort}`,
-    );
+    this.objectStore.setAddress(this.listenHost, this.listenPort);
+    this.log.info(`Listening on ${this.listenHost}:${this.listenPort}`);
 
     // Connect to Discovery
     const rawConn = await Deno.connect({
@@ -91,23 +109,22 @@ export class ProcessNode {
     });
     this.discoveryConn = new FramedConnection(rawConn);
 
-    // Register with Discovery
+    // Register with Discovery (include both task functions and actor names)
     await this.discoveryConn.writeMessage({
       type: "register",
       processId: this.processId,
       host: this.listenHost,
       port: this.listenPort,
-      funcs: this.registry.list(),
+      funcs: [...this.registry.list(), ...this.registry.listActors()],
       maxConcurrency: this.maxConcurrency,
     });
 
-    // Wait for registered response
-    const response = await this.discoveryConn.readMessage();
-    if (response === null || (response as DiscoveryMessage).type !== "registered") {
+    // Wait for registered response (validated)
+    const response = await this.discoveryConn.readDiscoveryMessage();
+    if (response === null || response.type !== "registered") {
       throw new Error("Failed to register with Discovery");
     }
-    const registered = response as RegisteredMessage;
-    console.log(`[Node ${registered.processId}] Registered with Discovery.`);
+    this.log.info("Registered with Discovery");
 
     // Start discovery message loop (heartbeat, shutdown, and dispatch to waiters)
     this.discoveryLoopPromise = this.discoveryLoop();
@@ -147,14 +164,10 @@ export class ProcessNode {
 
     // Wait for in-flight tasks to complete (graceful drain)
     if (this.activeTasks > 0) {
-      console.log(
-        `[Node ${this.processId}] Draining ${this.activeTasks} active task(s)...`,
-      );
+      this.log.info(`Draining ${this.activeTasks} active task(s)`);
       await this.waitForDrain(drainTimeout);
       if (this.activeTasks > 0) {
-        console.warn(
-          `[Node ${this.processId}] Drain timeout reached, ${this.activeTasks} task(s) still active.`,
-        );
+        this.log.warn(`Drain timeout reached, ${this.activeTasks} task(s) still active`);
       }
     }
 
@@ -175,6 +188,12 @@ export class ProcessNode {
     }
     this.incomingMuxes.clear();
 
+    // Destroy all actor instances
+    for (const [, actor] of this.actorInstances) {
+      actor.destroy();
+    }
+    this.actorInstances.clear();
+
     // Abort any in-progress reconnection
     if (this.reconnectedResolve) {
       this.reconnectedResolve();
@@ -189,7 +208,7 @@ export class ProcessNode {
       this.reconnectLoopPromise,
     ].filter(Boolean));
 
-    console.log(`[Node ${this.processId}] Closed.`);
+    this.log.info("Closed");
   }
 
   /**
@@ -220,6 +239,39 @@ export class ProcessNode {
       () => this.doSpawn(func, args, taskId, timeout, execTimeout, highWaterMark),
       taskId,
     );
+  }
+
+  /**
+   * Create an actor on a remote peer. Queries Discovery for an available peer,
+   * connects P2P, sends actor_create, and returns an ActorHandle.
+   */
+  async createActor(name: string): Promise<ActorHandle> {
+    const peers = await this.findPeers(name, []);
+
+    // If no peers found by actor name, try any peer that has capacity
+    // Actor creation uses the same peer discovery as tasks
+    if (peers.length === 0) {
+      throw new SpawnError(`No peers available for actor "${name}"`);
+    }
+
+    for (const peer of peers) {
+      try {
+        const mux = await this.getMultiplexer(peer.host, peer.port);
+        return await requestActorCreation(mux, name);
+      } catch {
+        // Try next peer
+      }
+    }
+
+    throw new SpawnError(`Failed to create actor "${name}" on any peer`);
+  }
+
+  put(data: unknown): ObjectRef {
+    return this.objectStore.put(data);
+  }
+
+  getObjectStore(): ObjectStore {
+    return this.objectStore;
   }
 
   /**
@@ -416,31 +468,42 @@ export class ProcessNode {
     if (!this.discoveryConn) return;
     try {
       while (this.running && !this.discoveryConn.isClosed) {
-        const msg = await this.discoveryConn.readMessage();
+        const msg = await this.discoveryConn.readDiscoveryMessage();
         if (msg === null) break;
 
-        const dm = msg as DiscoveryMessage;
-        switch (dm.type) {
+        switch (msg.type) {
           case "heartbeat":
             if (!this.discoveryConn.isClosed) {
               await this.discoveryConn.writeMessage({ type: "heartbeat_ack" });
             }
             break;
           case "shutdown":
-            console.log(`[Node ${this.processId}] Received shutdown from Discovery.`);
+            this.log.info("Received shutdown from Discovery");
             this.shutdownRequested = true;
             this.running = false;
             await this.close();
             return;
-          default:
-            // Dispatch to waiting callers (find -> found, request_spawn -> spawn_result)
-            this.dispatchToWaiters(dm);
+          // Messages dispatched to pending waiters
+          case "registered":
+          case "found":
+          case "spawn_result":
+          case "heartbeat_ack":
+            this.dispatchToWaiters(msg);
             break;
+          // Messages that a Node sends (not expected from Discovery)
+          case "register":
+          case "capacity_change":
+          case "find":
+          case "request_spawn":
+          case "bye":
+            break;
+          default:
+            assertNever(msg);
         }
       }
-    } catch {
+    } catch (e) {
       if (this.running) {
-        console.error(`[Node ${this.processId}] Discovery connection lost.`);
+        this.log.error(`Discovery connection lost: ${e instanceof Error ? e.message : String(e)}`);
       }
     } finally {
       if (!this.draining && !this.shutdownRequested && this.running) {
@@ -480,9 +543,7 @@ export class ProcessNode {
     let delay = RECONNECT_INITIAL_DELAY;
 
     while (this.running && !this.draining && !this.shutdownRequested) {
-      console.log(
-        `[Node ${this.processId}] Reconnecting to Discovery in ${delay}ms...`,
-      );
+      this.log.info(`Reconnecting to Discovery in ${delay}ms`);
       await new Promise<void>((r) => setTimeout(r, delay));
 
       if (!this.running || this.draining || this.shutdownRequested) break;
@@ -494,29 +555,24 @@ export class ProcessNode {
         });
         const fc = new FramedConnection(rawConn);
 
-        // Re-register with Discovery
+        // Re-register with Discovery (include both task functions and actor names)
         await fc.writeMessage({
           type: "register",
           processId: this.processId,
           host: this.listenHost,
           port: this.listenPort,
-          funcs: this.registry.list(),
+          funcs: [...this.registry.list(), ...this.registry.listActors()],
           maxConcurrency: this.maxConcurrency,
         });
 
-        const response = await fc.readMessage();
-        if (
-          response === null ||
-          (response as DiscoveryMessage).type !== "registered"
-        ) {
+        const response = await fc.readDiscoveryMessage();
+        if (response === null || response.type !== "registered") {
           fc.close();
           throw new Error("Failed to register with Discovery");
         }
 
         this.discoveryConn = fc;
-        console.log(
-          `[Node ${this.processId}] Reconnected to Discovery.`,
-        );
+        this.log.info("Reconnected to Discovery");
 
         // Report current capacity so Discovery has accurate state
         await this.discoveryConn.writeMessage({
@@ -535,9 +591,7 @@ export class ProcessNode {
         this.reconnectedResolve = null;
         return;
       } catch (e) {
-        console.error(
-          `[Node ${this.processId}] Reconnection failed: ${e}`,
-        );
+        this.log.error(`Reconnection failed: ${e}`);
         delay = Math.min(delay * 2, RECONNECT_MAX_DELAY);
       }
     }
@@ -576,8 +630,22 @@ export class ProcessNode {
       this.incomingMuxes.delete(mux);
     });
     mux.setUnroutedHandler((msg: P2PMessage) => {
-      if (msg.type === "exec") {
-        this.handleExecRequest(mux, msg as ExecMessage);
+      switch (msg.type) {
+        case "exec":
+          this.handleExecRequest(mux, msg);
+          break;
+        case "actor_create":
+          this.handleActorCreate(mux, msg);
+          break;
+        case "actor_call":
+          this.handleActorCall(mux, msg);
+          break;
+        case "actor_destroy":
+          this.handleActorDestroy(mux, msg);
+          break;
+        case "object_fetch":
+          this.handleObjectFetch(mux, msg);
+          break;
       }
     });
     mux.startReading();
@@ -589,6 +657,7 @@ export class ProcessNode {
    */
   private handleExecRequest(mux: Multiplexer, msg: ExecMessage): void {
     if (this.draining || this.activeTasks >= this.maxConcurrency) {
+      this.nodeMetrics.recordRejection("at_capacity");
       mux.writeMessage({
         type: "reject",
         taskId: msg.taskId,
@@ -599,6 +668,7 @@ export class ProcessNode {
 
     const taskFn = this.registry.get(msg.func);
     if (!taskFn) {
+      this.nodeMetrics.recordRejection("unknown_func");
       mux.writeMessage({
         type: "reject",
         taskId: msg.taskId,
@@ -617,6 +687,7 @@ export class ProcessNode {
     msg: ExecMessage,
     taskFn: TaskFunction,
   ): Promise<void> {
+    const taskLog = this.log.child({ task: msg.taskId.slice(0, 8), func: msg.func });
     this.notifyCapacityChange();
 
     try {
@@ -629,6 +700,13 @@ export class ProcessNode {
       this.notifyCapacityChange();
       return;
     }
+
+    this.nodeMetrics.recordTaskSpawned();
+    taskLog.info("Executing task");
+
+    // Resolve any ObjectRef arguments to actual data
+    const resolvedArgs = await this.resolveObjectRefs(msg.args);
+    const startTime = Date.now();
 
     const spawnFn = (func: string, args: unknown[]): Channel => {
       return this.spawn(func, args);
@@ -644,7 +722,7 @@ export class ProcessNode {
         let timeoutId: number | undefined;
         try {
           result = await Promise.race([
-            taskFn(ctx, ...msg.args),
+            taskFn(ctx, ...resolvedArgs),
             new Promise<never>((_, reject) => {
               timeoutId = setTimeout(() => {
                 reject(new ExecTimeoutError(msg.func, execTimeout));
@@ -655,9 +733,12 @@ export class ProcessNode {
           if (timeoutId !== undefined) clearTimeout(timeoutId);
         }
       } else {
-        result = await taskFn(ctx, ...msg.args);
+        result = await taskFn(ctx, ...resolvedArgs);
       }
 
+      this.nodeMetrics.recordTaskCompleted();
+      this.nodeMetrics.recordTaskLatency(Date.now() - startTime);
+      taskLog.info("Task completed");
       await mux.writeMessage({
         type: "result",
         taskId: msg.taskId,
@@ -665,6 +746,9 @@ export class ProcessNode {
       });
     } catch (e: unknown) {
       const err = e instanceof Error ? e : new Error(String(e));
+      this.nodeMetrics.recordTaskFailed();
+      this.nodeMetrics.recordTaskLatency(Date.now() - startTime);
+      taskLog.error(`Task failed: ${err.message}`);
       try {
         await mux.writeMessage({
           type: "error",
@@ -695,11 +779,196 @@ export class ProcessNode {
     }
   }
 
+  private handleActorCreate(mux: Multiplexer, msg: ActorCreateMessage): void {
+    const actorLog = this.log.child({ actor: msg.actorName });
+
+    if (this.draining || this.activeTasks >= this.maxConcurrency) {
+      actorLog.debug("Actor create rejected: at capacity");
+      mux.writeMessage({
+        type: "actor_create_result",
+        taskId: msg.taskId,
+        error: { message: "At capacity", name: "SpawnError" },
+      }).catch(() => {});
+      return;
+    }
+
+    const cls = this.registry.getActor(msg.actorName);
+    if (!cls) {
+      actorLog.debug("Actor create rejected: unknown actor");
+      mux.writeMessage({
+        type: "actor_create_result",
+        taskId: msg.taskId,
+        error: { message: `Unknown actor "${msg.actorName}"`, name: "SpawnError" },
+      }).catch(() => {});
+      return;
+    }
+
+    const actorId = crypto.randomUUID();
+    const instance = new ActorInstance(actorId, cls);
+    this.actorInstances.set(actorId, instance);
+    this.activeTasks++;
+    this.nodeMetrics.recordTaskSpawned();
+    this.notifyCapacityChange();
+    actorLog.info(`Actor created: ${actorId.slice(0, 8)}`);
+
+    mux.writeMessage({
+      type: "actor_create_result",
+      taskId: msg.taskId,
+      actorId,
+    }).catch(() => {
+      this.actorInstances.delete(actorId);
+      instance.destroy();
+      this.activeTasks--;
+      this.notifyCapacityChange();
+    });
+  }
+
+  private async handleActorCall(mux: Multiplexer, msg: ActorCallMessage): Promise<void> {
+    const instance = this.actorInstances.get(msg.actorId);
+    if (!instance) {
+      this.log.debug(`Actor call failed: actor ${msg.actorId.slice(0, 8)} not found`);
+      await mux.writeMessage({
+        type: "actor_error",
+        taskId: msg.taskId,
+        error: { message: `Actor "${msg.actorId}" not found`, name: "Error" },
+      }).catch(() => {});
+      return;
+    }
+    try {
+      const value = await instance.call(msg.method, msg.args);
+      await mux.writeMessage({ type: "actor_result", taskId: msg.taskId, value });
+    } catch (e: unknown) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      this.log.warn(`Actor call failed: ${msg.actorId.slice(0, 8)}.${msg.method}: ${err.message}`);
+      await mux.writeMessage({
+        type: "actor_error",
+        taskId: msg.taskId,
+        error: { message: err.message, name: err.name, stack: err.stack },
+      }).catch(() => {});
+    }
+  }
+
+  private handleActorDestroy(mux: Multiplexer, msg: ActorDestroyMessage): void {
+    const instance = this.actorInstances.get(msg.actorId);
+    if (!instance) {
+      mux.writeMessage({
+        type: "actor_error",
+        taskId: msg.taskId,
+        error: { message: `Actor "${msg.actorId}" not found`, name: "Error" },
+      }).catch(() => {});
+      return;
+    }
+
+    instance.destroy();
+    this.actorInstances.delete(msg.actorId);
+    this.activeTasks--;
+    this.nodeMetrics.recordTaskCompleted();
+    this.notifyCapacityChange();
+    this.log.info(`Actor destroyed: ${msg.actorId.slice(0, 8)}`);
+
+    if (this.draining && this.activeTasks === 0) {
+      for (const resolver of this.drainResolvers) { resolver(); }
+      this.drainResolvers = [];
+    }
+
+    mux.writeMessage({ type: "actor_result", taskId: msg.taskId, value: null }).catch(() => {});
+    this.healthCheck();
+  }
+
+  private handleObjectFetch(mux: Multiplexer, msg: ObjectFetchMessage): void {
+    const found = this.objectStore.has(msg.objectId);
+    const data = found ? this.objectStore.getById(msg.objectId) : null;
+    this.log.debug(`Object fetch: ${msg.objectId.slice(0, 8)} found=${found}`);
+    mux.writeMessage({
+      type: "object_fetch_response",
+      taskId: msg.taskId,
+      objectId: msg.objectId,
+      found,
+      data,
+    }).catch(() => {});
+  }
+
+  private async resolveObjectRefs(args: unknown[]): Promise<unknown[]> {
+    const resolved: unknown[] = [];
+    for (const arg of args) {
+      if (arg instanceof ObjectRef) {
+        if (this.objectStore.has(arg.id)) {
+          resolved.push(this.objectStore.getById(arg.id));
+        } else {
+          const data = await this.fetchRemoteObject(arg);
+          this.objectStore.cache(arg.id, data);
+          resolved.push(data);
+        }
+      } else {
+        resolved.push(arg);
+      }
+    }
+    return resolved;
+  }
+
+  private async fetchRemoteObject(ref: ObjectRef): Promise<unknown> {
+    // Connect directly to the owner node using its address
+    try {
+      const mux = await this.getMultiplexer(ref.ownerHost, ref.ownerPort);
+      return await this.fetchObjectFromMux(mux, ref.id);
+    } catch {
+      // Owner node unreachable
+    }
+    // Fallback: try existing connections
+    for (const [, mux] of this.connectionPool) {
+      if (mux.isClosed) continue;
+      try {
+        return await this.fetchObjectFromMux(mux, ref.id);
+      } catch {
+        continue;
+      }
+    }
+    for (const mux of this.incomingMuxes) {
+      if (mux.isClosed) continue;
+      try {
+        return await this.fetchObjectFromMux(mux, ref.id);
+      } catch {
+        continue;
+      }
+    }
+    throw new Error(`Failed to fetch object ${ref.id} from owner ${ref.ownerHost}:${ref.ownerPort}`);
+  }
+
+  private fetchObjectFromMux(mux: Multiplexer, objectId: string): Promise<unknown> {
+    return new Promise<unknown>((resolve, reject) => {
+      const taskId = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        mux.unregisterTask(taskId);
+        reject(new Error("Object fetch timeout"));
+      }, 10_000);
+      mux.registerTask(taskId, (msg: P2PMessage) => {
+        clearTimeout(timer);
+        mux.unregisterTask(taskId);
+        if (msg.type === "object_fetch_response" && msg.objectId === objectId) {
+          if (msg.found) {
+            resolve(msg.data);
+          } else {
+            reject(new Error(`Object ${objectId} not found on remote`));
+          }
+        } else {
+          reject(new Error("Unexpected response"));
+        }
+      });
+      mux.writeMessage({
+        type: "object_fetch",
+        taskId,
+        objectId,
+      }).catch((err) => {
+        clearTimeout(timer);
+        mux.unregisterTask(taskId);
+        reject(err);
+      });
+    });
+  }
+
   private healthCheck(): void {
     if (!this.checkHealth()) {
-      console.error(
-        `[Node ${this.processId}] Health check failed. Shutting down.`,
-      );
+      this.log.error("Health check failed, shutting down");
       this.running = false;
       this.close();
     }
@@ -709,9 +978,7 @@ export class ProcessNode {
     try {
       const mem = Deno.memoryUsage();
       if (mem.heapUsed > MEMORY_THRESHOLD) {
-        console.warn(
-          `[Node ${this.processId}] Memory usage too high: ${mem.heapUsed} bytes`,
-        );
+        this.log.warn(`Memory usage too high: ${mem.heapUsed} bytes`);
         return false;
       }
       return true;
@@ -730,6 +997,11 @@ export class ProcessNode {
         // Discovery connection may be lost
       });
     }
+  }
+
+  getMetrics(): MetricsSnapshot {
+    this.nodeMetrics.setActiveTaskCount(this.activeTasks);
+    return this.nodeMetrics.getMetrics();
   }
 
   get isShutdownRequested(): boolean {
@@ -812,14 +1084,30 @@ class PendingChannel implements Channel {
 // Public factory: connect to Discovery and create a ProcessNode
 // ============================================================
 
+export function toRegistry(value: Registry | TaskRecord): Registry {
+  if (value instanceof Registry) return value;
+  return Registry.from(value);
+}
+
 export async function connect(
   opts: NodeConfig,
 ): Promise<ProcessNode> {
   let registry = new Registry();
 
   if (opts.registry) {
-    const mod = await import(opts.registry);
-    registry = mod.default as Registry;
+    const registryPath = opts.registry.startsWith(".")
+      ? new URL(opts.registry, `file://${Deno.cwd()}/`).href
+      : opts.registry;
+    let mod;
+    try {
+      mod = await import(registryPath);
+    } catch (e) {
+      throw new Error(`Failed to load registry "${opts.registry}": ${e}`);
+    }
+    if (mod.default == null) {
+      throw new Error(`Registry module "${opts.registry}" has no default export`);
+    }
+    registry = toRegistry(mod.default);
   }
 
   const node = new ProcessNode(opts, registry);
